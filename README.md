@@ -22,7 +22,7 @@ Drop the plugin folder somewhere stable — a common pattern is `~/.config/nvim/
 
 ```lua
 return {
-  dir = vim.fn.expand("git.coreprotocol.org/u/enot/pio.nvim"),
+  dir = vim.fn.expand("446564/pio.nvim"),
   ft = { "c", "cpp", "objc", "objcpp" },
   cmd = { "PioEnv", "PioStatus" },
   opts = {
@@ -50,7 +50,7 @@ return {
 
 ```lua
 use {
-  "git.coreprotocol.org/u/enot/pio.nvim",
+  "446564/pio.nvim",
   config = function()
     require("pio").setup({})
     vim.keymap.set("n", "<leader>pe", "<cmd>PioEnv<cr>",    { desc = "PIO: switch env" })
