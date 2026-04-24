@@ -1,6 +1,6 @@
 # pio.nvim
 
-Manual PlatformIO environment switcher for multi-variant projects. Run `:PioEnv`, pick an env (auto-selected if the current file only matches one), and the plugin regenerates `compile_commands.json` for that env and restarts clangd — so the LSP analyzes your code with the right defines, the right arch, and the right include paths.
+A Neovim plugin for PlatformIO projects with lots of environments. Pick an env and it regenerates `compile_commands.json` + restarts clangd (so the LSP analyzes your code with the right defines, arch, and includes). Then build, upload, and monitor from the same env without leaving the editor.
 
 Built for projects like [MeshCore](https://github.com/ripplebiz/MeshCore) that define hundreds of PlatformIO environments across multiple MCU architectures (ESP32, nRF52, RP2040, STM32) where a single flat `compile_commands.json` can't possibly represent them all at once.
 
@@ -22,15 +22,19 @@ Manually running `pio run -t compiledb -e <env>` every time you change focus wor
 return {
   "446564/pio.nvim",
   ft = { "c", "cpp", "objc", "objcpp" },
-  cmd = { "PioEnv", "PioStatus" },
+  cmd = { "PioEnv", "PioStatus", "PioDevice", "PioBuild", "PioUpload", "PioMonitor" },
   opts = {
     -- pio_cmd = "pio",
     -- auto_pick_single = true,
     -- always_show_all_envs_as_fallback = true,
   },
   keys = {
-    { "<leader>pe", "<cmd>PioEnv<cr>",    desc = "PIO: switch env (from current file)" },
-    { "<leader>ps", "<cmd>PioStatus<cr>", desc = "PIO: status for current buffer" },
+    { "<leader>pe", "<cmd>PioEnv<cr>",     desc = "PIO: switch env (compile_commands.json)" },
+    { "<leader>ps", "<cmd>PioStatus<cr>",  desc = "PIO: status" },
+    { "<leader>pd", "<cmd>PioDevice<cr>",  desc = "PIO: select device" },
+    { "<leader>pb", "<cmd>PioBuild<cr>",   desc = "PIO: build" },
+    { "<leader>pu", "<cmd>PioUpload<cr>",  desc = "PIO: upload" },
+    { "<leader>pm", "<cmd>PioMonitor<cr>", desc = "PIO: monitor" },
   },
   init = function()
     -- Register the <leader>p group label for which-key.
@@ -51,8 +55,15 @@ use {
   "446564/pio.nvim",
   config = function()
     require("pio").setup({})
-    vim.keymap.set("n", "<leader>pe", "<cmd>PioEnv<cr>",    { desc = "PIO: switch env" })
-    vim.keymap.set("n", "<leader>ps", "<cmd>PioStatus<cr>", { desc = "PIO: status" })
+    local map = function(lhs, cmd, desc)
+      vim.keymap.set("n", lhs, "<cmd>" .. cmd .. "<cr>", { desc = desc })
+    end
+    map("<leader>pe", "PioEnv",     "PIO: switch env")
+    map("<leader>ps", "PioStatus",  "PIO: status")
+    map("<leader>pd", "PioDevice",  "PIO: select device")
+    map("<leader>pb", "PioBuild",   "PIO: build")
+    map("<leader>pu", "PioUpload",  "PIO: upload")
+    map("<leader>pm", "PioMonitor", "PIO: monitor")
   end,
 }
 ```
@@ -61,13 +72,18 @@ use {
 
 | Keymap | Command | Behavior |
 |---|---|---|
-| `<leader>pe` | `:PioEnv` | Regenerate for env matching the current file. Auto-picks when only one env matches; otherwise opens a picker grouped as "matches for variants/foo" and "all other envs". |
-| — | `:PioEnv <env_name>` | Regenerate for the named env directly. Tab-completes. |
-| `<leader>ps` | `:PioStatus` | Print detected variant, arch, and matching envs for the current buffer. |
+| `<leader>pe` | `:PioEnv [name]` | Set the target env and regenerate `compile_commands.json` for it. Auto-picks when only one env matches the current file; otherwise opens a picker. |
+| `<leader>ps` | `:PioStatus` | Show session state (target env, device, last compiled env) and the current file's variant/arch/matching-envs. |
+| `<leader>pd` | `:PioDevice` | Run `pio device list` and pick an upload port. Stored in session state and used by `:PioUpload`/`:PioMonitor`. Pick "clear selection" to fall back to pio's auto-detection. |
+| `<leader>pb` | `:PioBuild [name]` | Build the target env (`pio run -e <env>`). If no env is set, resolves from current file or prompts. |
+| `<leader>pu` | `:PioUpload [name]` | Upload the target env (`pio run -t upload -e <env>`), to the selected device if one is set (`--upload-port`). |
+| `<leader>pm` | `:PioMonitor [name]` | Open `pio device monitor` in a bottom split. Focus stays in your code window. Press `q` in the monitor to stop it and close the split; the serial port is always released when the buffer goes away. |
 
-The `<leader>p` prefix is reserved for future PlatformIO-related commands — add your own under it without worrying about collisions with LazyVim defaults (which uses `<leader>p` only inside tabs/snacks submenus, not as a top-level prefix).
+All three build/upload/monitor commands share **env resolution**: they use the target env (set by `:PioEnv` or by a previous picker choice), or fall back to the current file's single-match env, or prompt with the picker. The picker stores your choice as the new target, so subsequent commands in the same session are one-keystroke.
 
-The regeneration runs in a floating window that streams `pio` output live. Dismiss with `<CR>`, `<Esc>`, `q`, or `<Space>` once it finishes. On success, clangd is stopped and re-attached.
+The `<leader>p` prefix is reserved for PlatformIO-related commands — add your own under it without collisions with LazyVim defaults (which don't use `<leader>p` as a top-level group).
+
+The build/upload/compile_commands runs appear in a floating window that streams `pio` output live. Dismiss with `<CR>`, `<Esc>`, `q`, or `<Space>` once the process exits.
 
 ## How file-to-env mapping works
 

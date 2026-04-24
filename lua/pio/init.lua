@@ -23,7 +23,10 @@ local state = {
 	root = nil, -- project root (dir containing platformio.ini)
 	envs = nil, -- cached list of { name, variant_dir, archs, ini_path }
 	envs_mtime = nil, -- aggregate mtime of ini files when parsed
-	last_env = nil, -- last env we regenerated for
+	last_env = nil, -- last env we regenerated compile_commands.json for
+	-- Session-only (wiped on nvim restart):
+	target_env = nil, -- env for build/upload/monitor; set by :PioEnv or picker
+	device = nil, -- upload port (e.g. /dev/ttyUSB0); nil = pio auto-detect
 }
 
 -- ---------------------------------------------------------------------------
@@ -422,10 +425,28 @@ end
 -- compiledb runner
 -- ---------------------------------------------------------------------------
 
-local function run_compiledb(root, env_name, on_done)
-	local progress = open_progress_window("Regenerating compile_commands.json [" .. env_name .. "]")
-	progress.append("$ " .. config.pio_cmd .. " run -t compiledb -e " .. env_name)
-	progress.append("  cwd: " .. root)
+-- ---------------------------------------------------------------------------
+-- generic pio runner
+--
+-- Spawns `pio <args...>` in `root`, streams stdout+stderr into a progress
+-- window, and calls on_done(exit_code) when finished. The window becomes
+-- dismissible (any of <CR>/<Esc>/q/<Space>) only after the process exits,
+-- so users can't accidentally close it mid-run.
+-- ---------------------------------------------------------------------------
+
+local function make_dismissible(progress)
+	for _, key in ipairs({ "<CR>", "<Esc>", "q", "<Space>" }) do
+		vim.keymap.set("n", key, function()
+			progress.close()
+		end, { buffer = progress.buf, silent = true, nowait = true })
+	end
+end
+
+local function run_pio(opts)
+	-- opts: { root, args, title, on_done }
+	local progress = open_progress_window(opts.title)
+	progress.append("$ " .. config.pio_cmd .. " " .. table.concat(opts.args, " "))
+	progress.append("  cwd: " .. opts.root)
 	progress.append("")
 
 	local stdout = vim.loop.new_pipe(false)
@@ -442,8 +463,8 @@ local function run_compiledb(root, env_name, on_done)
 	end
 
 	handle = vim.loop.spawn(config.pio_cmd, {
-		args = { "run", "-t", "compiledb", "-e", env_name },
-		cwd = root,
+		args = opts.args,
+		cwd = opts.root,
 		stdio = { nil, stdout, stderr },
 	}, function(code, _)
 		stdout:close()
@@ -455,39 +476,51 @@ local function run_compiledb(root, env_name, on_done)
 			progress.append(string.format("--- exit code %d (%.1fs) ---", code, elapsed_ms / 1000))
 			if code == 0 then
 				progress.append("Press any key to close.")
-				state.last_env = env_name
 			else
 				progress.append("FAILED. Press any key to close.")
 			end
-			-- Single-keypress dismiss.
-			vim.keymap.set("n", "<buffer>", function()
-				progress.close()
-			end, { buffer = progress.buf, silent = true, nowait = true })
-			-- More permissive: close on any key.
-			for _, key in ipairs({ "<CR>", "<Esc>", "q", "<Space>" }) do
-				vim.keymap.set("n", key, function()
-					progress.close()
-				end, { buffer = progress.buf, silent = true, nowait = true })
-			end
+			make_dismissible(progress)
 			vim.api.nvim_set_current_win(progress.win)
-			if on_done then
-				on_done(code)
+			if opts.on_done then
+				opts.on_done(code)
 			end
 		end)
 	end)
 
 	if not handle then
 		progress.append("ERROR: failed to spawn `" .. config.pio_cmd .. "`")
-		if on_done then
-			on_done(-1)
+		progress.append("Is PlatformIO installed and on $PATH?")
+		make_dismissible(progress)
+		if opts.on_done then
+			opts.on_done(-1)
 		end
 		return
 	end
 
 	stdout:read_start(on_read)
 	stderr:read_start(on_read)
+	return progress
 end
 
+-- ---------------------------------------------------------------------------
+-- compiledb runner (thin wrapper on run_pio)
+-- ---------------------------------------------------------------------------
+
+local function run_compiledb(root, env_name, on_done)
+	run_pio({
+		root = root,
+		args = { "run", "-t", "compiledb", "-e", env_name },
+		title = "Regenerating compile_commands.json [" .. env_name .. "]",
+		on_done = function(code)
+			if code == 0 then
+				state.last_env = env_name
+			end
+			if on_done then
+				on_done(code)
+			end
+		end,
+	})
+end
 local function restart_clangd()
 	local clients
 	if vim.lsp.get_clients then
@@ -609,7 +642,7 @@ function M.switch(opts)
 		return
 	end
 
-	-- Explicit env passed via :PioEnv <name>
+	-- Explicit env passed via :PioEnv <n>
 	if opts.env and opts.env ~= "" then
 		local valid = false
 		for _, e in ipairs(envs) do
@@ -622,6 +655,7 @@ function M.switch(opts)
 			notify("unknown env: " .. opts.env, vim.log.levels.ERROR)
 			return
 		end
+		state.target_env = opts.env
 		run_compiledb(root, opts.env, function(code)
 			if code == 0 then
 				restart_clangd()
@@ -637,6 +671,7 @@ function M.switch(opts)
 	if config.auto_pick_single and #ranked.matched == 1 then
 		local env = ranked.matched[1].name
 		notify("single match: " .. env .. " -- regenerating")
+		state.target_env = env
 		run_compiledb(root, env, function(code)
 			if code == 0 then
 				restart_clangd()
@@ -646,11 +681,300 @@ function M.switch(opts)
 	end
 
 	pick_env(ranked, function(env_name)
+		state.target_env = env_name
 		run_compiledb(root, env_name, function(code)
 			if code == 0 then
 				restart_clangd()
 			end
 		end)
+	end)
+end
+-- ---------------------------------------------------------------------------
+-- env resolution for build/upload/monitor
+--
+-- Picks one env to operate on. Precedence:
+--   1. Explicit env argument (e.g. `:PioBuild Heltec_v3_repeater`).
+--   2. Session target_env (set by :PioEnv or by a previous picker choice).
+--   3. Current file ranks exactly one env -> use that.
+--   4. Prompt with the env picker; stores the choice as target_env.
+-- Callback: on_resolve(root, env_name). Never called if the user cancels.
+-- ---------------------------------------------------------------------------
+
+local function find_env_by_name(envs, name)
+	for _, e in ipairs(envs) do
+		if e.name == name then
+			return e
+		end
+	end
+	return nil
+end
+
+local function resolve_env(explicit, on_resolve)
+	local root = ensure_root()
+	if not root then
+		return
+	end
+	local envs = get_envs(root)
+	if #envs == 0 then
+		notify("no [env:*] sections found", vim.log.levels.WARN)
+		return
+	end
+
+	if explicit and explicit ~= "" then
+		if find_env_by_name(envs, explicit) then
+			on_resolve(root, explicit)
+		else
+			notify("unknown env: " .. explicit, vim.log.levels.ERROR)
+		end
+		return
+	end
+
+	if state.target_env and find_env_by_name(envs, state.target_env) then
+		on_resolve(root, state.target_env)
+		return
+	end
+
+	local buf_path = vim.api.nvim_buf_get_name(0)
+	local abs = vim.fn.fnamemodify(buf_path, ":p")
+	local ranked = rank_envs_for_file(root, abs, envs)
+
+	if config.auto_pick_single and #ranked.matched == 1 then
+		state.target_env = ranked.matched[1].name
+		on_resolve(root, state.target_env)
+		return
+	end
+
+	pick_env(ranked, function(env_name)
+		state.target_env = env_name
+		on_resolve(root, env_name)
+	end)
+end
+
+-- ---------------------------------------------------------------------------
+-- device (upload port) selection
+-- ---------------------------------------------------------------------------
+
+local function parse_device_list(text)
+	-- `pio device list` format (one block per port, blank-line separated):
+	--   /dev/ttyUSB0
+	--   ----------
+	--   Hardware ID: USB VID:PID=10C4:EA60 ...
+	--   Description: CP2102N USB to UART Bridge Controller
+	local devices = {}
+	local current = nil
+	for line in vim.gsplit(text, "\n", { plain = true }) do
+		if line:match("^/") or line:match("^COM%d+") then
+			if current then
+				table.insert(devices, current)
+			end
+			current = { port = vim.trim(line), description = "" }
+		elseif current then
+			local desc = line:match("^Description:%s*(.+)$")
+			if desc then
+				current.description = vim.trim(desc)
+			end
+		end
+	end
+	if current then
+		table.insert(devices, current)
+	end
+	return devices
+end
+
+function M.pick_device()
+	local root = ensure_root()
+	if not root then
+		return
+	end
+
+	notify("scanning devices...")
+
+	local stdout_chunks = {}
+	local stderr_chunks = {}
+	local stdout = vim.loop.new_pipe(false)
+	local stderr = vim.loop.new_pipe(false)
+	local handle
+	handle = vim.loop.spawn(config.pio_cmd, {
+		args = { "device", "list" },
+		cwd = root,
+		stdio = { nil, stdout, stderr },
+	}, function(code, _)
+		stdout:close()
+		stderr:close()
+		handle:close()
+		vim.schedule(function()
+			if code ~= 0 then
+				notify(
+					"pio device list failed (code " .. code .. "):\n" .. table.concat(stderr_chunks, ""),
+					vim.log.levels.ERROR
+				)
+				return
+			end
+			local devices = parse_device_list(table.concat(stdout_chunks, ""))
+			if #devices == 0 then
+				notify("no devices detected", vim.log.levels.WARN)
+				return
+			end
+
+			local display = {}
+			for _, d in ipairs(devices) do
+				if d.description ~= "" then
+					table.insert(display, d.port .. "  (" .. d.description .. ")")
+				else
+					table.insert(display, d.port)
+				end
+			end
+			table.insert(display, "── clear selection (use pio default) ──")
+
+			vim.ui.select(display, {
+				prompt = "Select upload device:",
+				format_item = function(i)
+					return i
+				end,
+			}, function(choice)
+				if not choice then
+					return
+				end
+				if choice:match("clear selection") then
+					state.device = nil
+					notify("device cleared; pio will auto-detect")
+					return
+				end
+				local port = choice:match("^(%S+)")
+				state.device = port
+				notify("device set: " .. port)
+			end)
+		end)
+	end)
+
+	if not handle then
+		notify("failed to spawn pio", vim.log.levels.ERROR)
+		return
+	end
+
+	stdout:read_start(function(_, data)
+		if data then
+			table.insert(stdout_chunks, data)
+		end
+	end)
+	stderr:read_start(function(_, data)
+		if data then
+			table.insert(stderr_chunks, data)
+		end
+	end)
+end
+
+-- ---------------------------------------------------------------------------
+-- build / upload
+-- ---------------------------------------------------------------------------
+
+function M.build(opts)
+	opts = opts or {}
+	resolve_env(opts.env, function(root, env_name)
+		run_pio({
+			root = root,
+			args = { "run", "-e", env_name },
+			title = "Building [" .. env_name .. "]",
+		})
+	end)
+end
+
+function M.upload(opts)
+	opts = opts or {}
+	resolve_env(opts.env, function(root, env_name)
+		local args = { "run", "-t", "upload", "-e", env_name }
+		if state.device then
+			table.insert(args, "--upload-port")
+			table.insert(args, state.device)
+		end
+		local title = "Uploading [" .. env_name .. "]"
+		if state.device then
+			title = title .. " -> " .. state.device
+		end
+		run_pio({
+			root = root,
+			args = args,
+			title = title,
+		})
+	end)
+end
+
+-- ---------------------------------------------------------------------------
+-- monitor (serial terminal in bottom split)
+--
+-- Opens `pio device monitor` in a bottom split via termopen(). Focus stays
+-- in the original window so you can keep editing while watching serial
+-- output. Close with `q` in normal mode or :q/:bd from the terminal window;
+-- in all cases the child pio process is SIGTERM'd so the serial port gets
+-- released (otherwise subsequent uploads fail with "resource busy").
+-- ---------------------------------------------------------------------------
+
+function M.monitor(opts)
+	opts = opts or {}
+	resolve_env(opts.env, function(root, env_name)
+		local args = { "device", "monitor", "-e", env_name }
+		if state.device then
+			table.insert(args, "-p")
+			table.insert(args, state.device)
+		end
+
+		local origin_win = vim.api.nvim_get_current_win()
+
+		vim.cmd("botright 15split")
+		local term_win = vim.api.nvim_get_current_win()
+		local buf = vim.api.nvim_create_buf(false, true)
+		vim.api.nvim_win_set_buf(term_win, buf)
+		vim.api.nvim_buf_set_option(buf, "bufhidden", "wipe")
+
+		local bufname = "pio-monitor://" .. env_name
+		if state.device then
+			bufname = bufname .. "@" .. state.device
+		end
+		pcall(vim.api.nvim_buf_set_name, buf, bufname)
+
+		local cmd = { config.pio_cmd }
+		for _, a in ipairs(args) do
+			table.insert(cmd, a)
+		end
+
+		local job_id
+		local function kill_job()
+			if job_id and job_id > 0 then
+				pcall(vim.fn.jobstop, job_id)
+			end
+		end
+
+		vim.api.nvim_buf_call(buf, function()
+			job_id = vim.fn.termopen(cmd, {
+				cwd = root,
+				on_exit = function()
+					job_id = nil
+				end,
+			})
+		end)
+
+		if not job_id or job_id <= 0 then
+			notify("failed to start monitor (is pio installed?)", vim.log.levels.ERROR)
+			pcall(vim.api.nvim_win_close, term_win, true)
+			return
+		end
+
+		vim.api.nvim_create_autocmd({ "BufWipeout", "BufUnload" }, {
+			buffer = buf,
+			once = true,
+			callback = kill_job,
+		})
+
+		vim.keymap.set("n", "q", function()
+			kill_job()
+			if vim.api.nvim_win_is_valid(term_win) then
+				vim.api.nvim_win_close(term_win, true)
+			end
+		end, { buffer = buf, silent = true, nowait = true })
+
+		if vim.api.nvim_win_is_valid(origin_win) then
+			vim.api.nvim_set_current_win(origin_win)
+		end
 	end)
 end
 
@@ -664,47 +988,84 @@ function M.status()
 	local ranked = rank_envs_for_file(root, vim.fn.fnamemodify(buf_path, ":p"), envs)
 
 	local lines = {
-		"root:        " .. root,
-		"file:        " .. buf_path,
-		"variant:     " .. (ranked.file_variant or "-"),
-		"arch:        " .. (ranked.file_arch or "-"),
-		"last env:    " .. (state.last_env or "-"),
-		"total envs:  " .. #envs,
-		"matches:",
+		"-- project --",
+		"  root:          " .. root,
+		"  total envs:    " .. #envs,
+		"-- session --",
+		"  target env:    " .. (state.target_env or "-"),
+		"  device:        " .. (state.device or "- (pio default)"),
+		"  last compiled: " .. (state.last_env or "-"),
+		"-- current file --",
+		"  path:          " .. (buf_path ~= "" and buf_path or "-"),
+		"  variant:       " .. (ranked.file_variant or "-"),
+		"  arch:          " .. (ranked.file_arch or "-"),
+		"  matching envs: " .. #ranked.matched,
 	}
-	for _, e in ipairs(ranked.matched) do
-		table.insert(lines, "  " .. e.name .. " [" .. table.concat(e.archs, ",") .. "]")
+	for i, e in ipairs(ranked.matched) do
+		if i > 10 then
+			table.insert(lines, string.format("    ... and %d more", #ranked.matched - 10))
+			break
+		end
+		table.insert(lines, "    " .. e.name .. " [" .. table.concat(e.archs, ",") .. "]")
 	end
 	notify(table.concat(lines, "\n"))
 end
-
 function M.setup(user_opts)
 	config = vim.tbl_deep_extend("force", config, user_opts or {})
+
+	local function env_completer(arglead)
+		local root = ensure_root()
+		if not root then
+			return {}
+		end
+		local envs = get_envs(root)
+		local names = {}
+		for _, e in ipairs(envs) do
+			if e.name:lower():find(arglead:lower(), 1, true) then
+				table.insert(names, e.name)
+			end
+		end
+		return names
+	end
 
 	vim.api.nvim_create_user_command("PioEnv", function(cmd)
 		M.switch({ env = cmd.args })
 	end, {
 		nargs = "?",
-		desc = "Regenerate compile_commands.json for a PlatformIO env (maps from current file if no arg)",
-		complete = function(arglead)
-			local root = ensure_root()
-			if not root then
-				return {}
-			end
-			local envs = get_envs(root)
-			local names = {}
-			for _, e in ipairs(envs) do
-				if e.name:lower():find(arglead:lower(), 1, true) then
-					table.insert(names, e.name)
-				end
-			end
-			return names
-		end,
+		desc = "Set target PlatformIO env (regenerates compile_commands.json)",
+		complete = env_completer,
 	})
 
 	vim.api.nvim_create_user_command("PioStatus", function()
 		M.status()
-	end, { desc = "Show pio detected env info for current buffer" })
-end
+	end, { desc = "Show pio session state and current-file env mapping" })
 
+	vim.api.nvim_create_user_command("PioDevice", function()
+		M.pick_device()
+	end, { desc = "Select upload device from `pio device list`" })
+
+	vim.api.nvim_create_user_command("PioBuild", function(cmd)
+		M.build({ env = cmd.args })
+	end, {
+		nargs = "?",
+		desc = "Build the target env (or resolve from current file)",
+		complete = env_completer,
+	})
+
+	vim.api.nvim_create_user_command("PioUpload", function(cmd)
+		M.upload({ env = cmd.args })
+	end, {
+		nargs = "?",
+		desc = "Upload to the selected device for the target env",
+		complete = env_completer,
+	})
+
+	vim.api.nvim_create_user_command("PioMonitor", function(cmd)
+		M.monitor({ env = cmd.args })
+	end, {
+		nargs = "?",
+		desc = "Open serial monitor in a bottom split",
+		complete = env_completer,
+	})
+end
 return M
