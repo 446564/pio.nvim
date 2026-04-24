@@ -18,11 +18,9 @@ Manually running `pio run -t compiledb -e <env>` every time you change focus wor
 
 ## Install (LazyVim)
 
-Drop the plugin folder somewhere stable — a common pattern is `~/.config/nvim/lua/plugins/pio.nvim/`. Then create a spec file at `~/.config/nvim/lua/plugins/pio.lua`:
-
 ```lua
 return {
-  dir = vim.fn.expand("446564/pio.nvim"),
+  "446564/pio.nvim",
   ft = { "c", "cpp", "objc", "objcpp" },
   cmd = { "PioEnv", "PioStatus" },
   opts = {
