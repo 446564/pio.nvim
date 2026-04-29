@@ -1,8 +1,8 @@
 # pio.nvim
 
-A Neovim plugin for PlatformIO projects with lots of environments. Pick an env and it regenerates `compile_commands.json` + restarts clangd (so the LSP analyzes your code with the right defines, arch, and includes). Then build, upload, and monitor from the same env without leaving the editor.
+A Neovim plugin for [MeshCore](https://github.com/ripplebiz/MeshCore) projects with lots of environments. Pick an env and it regenerates `compile_commands.json` + restarts clangd (so the LSP analyzes your code with the right defines, arch, and includes). Then build, upload, and monitor from the same env without leaving the editor.
 
-Built for projects like [MeshCore](https://github.com/ripplebiz/MeshCore) that define hundreds of PlatformIO environments across multiple MCU architectures (ESP32, nRF52, RP2040, STM32) where a single flat `compile_commands.json` can't possibly represent them all at once.
+Built for [MeshCore](https://github.com/ripplebiz/MeshCore) that define hundreds of PlatformIO environments across multiple MCU architectures (ESP32, nRF52, RP2040, STM32) where a single flat `compile_commands.json` can't possibly represent them all at once.
 
 ## Why you'd want this
 
